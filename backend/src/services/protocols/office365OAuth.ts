@@ -23,9 +23,66 @@ export interface Office365OAuthAuth {
 export class Office365OAuthHandler extends BaseProtocolHandler {
   private httpClient: AxiosInstance | null = null;
   private auth: Office365OAuthAuth | null = null;
+  private requestCount: number = 0;
+  private lastRequestTime: number = 0;
+  private readonly MIN_REQUEST_INTERVAL = 100; // Minimum 100ms between requests
+  private readonly MAX_RETRIES = 5;
 
   constructor() {
     super();
+  }
+
+  /**
+   * Rate limit helper - adds delay between requests
+   */
+  private async rateLimit(): Promise<void> {
+    const now = Date.now();
+    const timeSinceLastRequest = now - this.lastRequestTime;
+
+    if (timeSinceLastRequest < this.MIN_REQUEST_INTERVAL) {
+      const delay = this.MIN_REQUEST_INTERVAL - timeSinceLastRequest;
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+
+    this.lastRequestTime = Date.now();
+    this.requestCount++;
+
+    // Add longer delay every 100 requests to avoid throttling
+    if (this.requestCount % 100 === 0) {
+      logger.debug(`Rate limiting: Adding 2s delay after ${this.requestCount} requests`);
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+  }
+
+  /**
+   * Retry helper with exponential backoff
+   */
+  private async retryWithBackoff<T>(
+    operation: () => Promise<T>,
+    context: string,
+    retryCount: number = 0
+  ): Promise<T> {
+    try {
+      await this.rateLimit();
+      return await operation();
+    } catch (error: any) {
+      const status = error.response?.status;
+      const retryAfter = error.response?.headers?.['retry-after'];
+
+      // Check if it's a throttling error (429) or server error (5xx)
+      if ((status === 429 || status >= 500) && retryCount < this.MAX_RETRIES) {
+        const delay = retryAfter
+          ? parseInt(retryAfter) * 1000
+          : Math.min(1000 * Math.pow(2, retryCount), 30000); // Exponential backoff, max 30s
+
+        logger.warn(`⚠️ ${context}: ${status === 429 ? 'Rate limited' : 'Server error'} (attempt ${retryCount + 1}/${this.MAX_RETRIES}). Retrying in ${delay}ms...`);
+
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return this.retryWithBackoff(operation, context, retryCount + 1);
+      }
+
+      throw error;
+    }
   }
 
   /**
@@ -191,12 +248,15 @@ export class Office365OAuthHandler extends BaseProtocolHandler {
 
     let nextLink: string | null = `https://graph.microsoft.com/v1.0/me/mailFolders/${folderId}/messages`;
     let processed = 0;
+    let pageCount = 0;
 
     // Add query parameters for Graph API
     const params = new URLSearchParams();
-    params.append('$top', (options.batchSize || 50).toString());
+    // Increase batch size from 50 to 999 (Graph API maximum)
+    params.append('$top', (options.batchSize || 999).toString());
     params.append('$orderby', 'receivedDateTime desc');
-    params.append('$select', 'id,subject,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,body,hasAttachments,attachments,parentFolderId,conversationId');
+    // Reduce fields to only what we need for email extraction
+    params.append('$select', 'id,subject,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,conversationId');
 
     if (options.since) {
       params.append('$filter', `receivedDateTime ge ${options.since.toISOString()}`);
@@ -206,14 +266,21 @@ export class Office365OAuthHandler extends BaseProtocolHandler {
 
     while (nextLink) {
       try {
-        logger.info(`🔍 Fetching messages from: ${nextLink}`);
+        pageCount++;
+        logger.info(`🔍 Fetching page ${pageCount} from folder ${folderName}...`);
 
-        const response: any = await axios.get(nextLink, {
-          headers: {
-            'Authorization': `Bearer ${this.auth.accessToken}`,
-            'Accept': 'application/json'
-          }
-        });
+        // Use retry logic with exponential backoff
+        const response: any = await this.retryWithBackoff(
+          () => axios.get(nextLink!, {
+            headers: {
+              'Authorization': `Bearer ${this.auth!.accessToken}`,
+              'Accept': 'application/json',
+              'Prefer': 'odata.maxpagesize=999' // Request maximum page size
+            },
+            timeout: 60000 // 60 second timeout
+          }),
+          `Sync folder ${folderName} page ${pageCount}`
+        );
 
         if (response.status !== 200 || !response.data.value) {
           logger.error('❌ Invalid response from Graph API');
@@ -221,21 +288,33 @@ export class Office365OAuthHandler extends BaseProtocolHandler {
         }
 
         const messages = response.data.value;
-        logger.info(`📧 Retrieved ${messages.length} messages from folder ${folderName}`);
+        logger.info(`📧 Retrieved ${messages.length} messages from folder ${folderName} (page ${pageCount}, total processed: ${processed})`);
 
+        // Process messages and yield them one by one (memory efficient)
         for (const message of messages) {
           try {
             const emailMessage = this.convertGraphMessageToEmailMessage(message, folderName);
             processed++;
 
-            this.emitProgress({
-              processed,
-              total: 0, // Graph API doesn't provide total count upfront
-              folder: folderName,
-              status: 'syncing'
-            });
+            // Update progress every 50 messages
+            if (processed % 50 === 0) {
+              this.emitProgress({
+                processed,
+                total: 0, // Graph API doesn't provide total count upfront
+                folder: folderName,
+                status: 'syncing'
+              });
+              logger.debug(`Progress: ${processed} messages processed from ${folderName}`);
+            }
 
             yield emailMessage;
+
+            // Force garbage collection hint every 1000 messages
+            if (processed % 1000 === 0 && global.gc) {
+              global.gc();
+              logger.debug(`Memory: Suggested GC after ${processed} messages`);
+            }
+
           } catch (error: any) {
             logger.warn(`⚠️ Skipping message due to conversion error: ${error.message}`);
           }
@@ -244,15 +323,40 @@ export class Office365OAuthHandler extends BaseProtocolHandler {
         // Check for next page
         nextLink = response.data['@odata.nextLink'] || null;
 
+        if (nextLink) {
+          logger.debug(`Next page available, continuing... (${processed} total so far)`);
+        }
+
       } catch (error: any) {
-        logger.error(`❌ Error syncing folder ${folderName}:`, error.message);
-        this.emitProgress({
-          processed,
-          total: 0,
-          folder: folderName,
-          status: 'error',
-          error: error.message
+        const status = error.response?.status;
+        const errorData = error.response?.data;
+
+        logger.error(`❌ Error syncing folder ${folderName} at page ${pageCount}:`, {
+          message: error.message,
+          status,
+          errorData,
+          processed
         });
+
+        // If we've processed some messages, don't fail completely
+        if (processed > 0) {
+          logger.warn(`⚠️ Partial sync completed: ${processed} messages retrieved before error`);
+          this.emitProgress({
+            processed,
+            total: processed,
+            folder: folderName,
+            status: 'completed',
+            error: `Partial sync: ${error.message}`
+          });
+        } else {
+          this.emitProgress({
+            processed,
+            total: 0,
+            folder: folderName,
+            status: 'error',
+            error: error.message
+          });
+        }
         break;
       }
     }
@@ -336,6 +440,7 @@ export class Office365OAuthHandler extends BaseProtocolHandler {
 
   /**
    * Convert Graph API message to EmailMessage format
+   * Optimized for email extraction - only includes essential fields
    */
   private convertGraphMessageToEmailMessage(message: any, folderName: string): EmailMessage {
     return {
@@ -359,16 +464,7 @@ export class Office365OAuthHandler extends BaseProtocolHandler {
         address: recipient.emailAddress?.address || ''
       })),
       date: new Date(message.receivedDateTime),
-      body: message.body?.content || '',
-      html: message.body?.contentType === 'html' ? message.body?.content : undefined,
-      text: message.body?.contentType === 'text' ? message.body?.content : undefined,
-      attachments: (message.attachments || []).map((attachment: any) => ({
-        filename: attachment.name,
-        size: attachment.size,
-        contentType: attachment.contentType,
-        contentId: attachment.contentId,
-        content: Buffer.alloc(0) // Placeholder - attachments need separate API call
-      })),
+      body: '', // Don't fetch body content for performance
       folder: folderName
     };
   }
