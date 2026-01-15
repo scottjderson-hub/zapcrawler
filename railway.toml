@@ -1,0 +1,22 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+numReplicas = 1
+sleepApplication = false
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+# Backend service
+[[services]]
+name = "backend"
+rootDirectory = "/backend"
+startCommand = "npm run start"
+buildCommand = "npm install && npm run build"
+
+# Frontend service
+[[services]]
+name = "frontend"
+rootDirectory = "/"
+startCommand = "npm run preview"
+buildCommand = "npm install && npm run build"
