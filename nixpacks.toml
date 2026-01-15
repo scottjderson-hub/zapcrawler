@@ -1,0 +1,31 @@
+[variables]
+NPM_CONFIG_PRODUCTION = "false"
+npm_config_target_platform = "linux"
+npm_config_target_arch = "x64"
+
+[providers]
+node = "20.x"
+
+[phases.setup]
+cmds = ["echo 'Using npm for package management'"]
+
+[phases.install]
+dependsOn = ["setup"]
+cmds = [
+  "npm cache clean --force",
+  "npm install",
+  "cd backend && npm install"
+]
+
+[phases.build]
+dependsOn = ["install"]
+cmds = [
+  "npm run build",
+  "cd backend && npm run build"
+]
+
+[start]
+cmd = "cd backend && npm start"
+
+[staticAssets]
+"dist" = "/"

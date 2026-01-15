@@ -1,0 +1,1756 @@
+import { useState, useEffect } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { 
+  getEmailAccounts, 
+  addEmailAccount, 
+  AddAccountPayload, 
+  deleteEmailAccount, 
+  deleteAllEmailAccounts, 
+  getProxies,
+  getSyncJobs,
+  getJobResults,
+  startSync,
+  autoDetectEmailSettings,
+  AutoDetectRequest,
+  deleteSyncJob,
+  deleteAllSyncJobs
+} from "@/lib/api";
+import { providerPresets } from "@/lib/provider-presets";
+import ResultsDisplay from '@/components/ResultsDisplay';
+import { useWebSocketContext } from '@/contexts/WebSocketContext';
+import { toast } from "sonner";
+import { 
+  Plus, 
+  Mail, 
+  Check, 
+  X, 
+  Settings, 
+  Trash2, 
+  Play,
+  Eye,
+  Download,
+  FileText,
+  Loader2,
+  Clock,
+  CheckCircle,
+  XCircle,
+  AlertCircle,
+  MoreHorizontal,
+  RefreshCw,
+  Users,
+  PlayCircle,
+  Upload,
+  FileUp
+} from "lucide-react";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger, DialogFooter } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
+import { FolderSelectionModal } from "../components/FolderSelectionModal";
+import { Textarea } from "@/components/ui/textarea";
+
+const initialFormState = {
+  provider: "",
+  email: "",
+  password: "",
+  server: "",
+  port: "",
+  security: "ssl",
+  proxyId: "",
+};
+
+export default function EmailAccountsAndJobs() {
+  const queryClient = useQueryClient();
+  
+  // Account management state
+  const [isAddAccountDialogOpen, setIsAddAccountDialogOpen] = useState(false);
+  const [formState, setFormState] = useState(initialFormState);
+  const [protocol, setProtocol] = useState<'IMAP' | 'POP3'>('POP3');
+  const [bulkAccounts, setBulkAccounts] = useState("");
+  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
+  
+  // Job management state
+  const [isCreateJobDialogOpen, setIsCreateJobDialogOpen] = useState(false);
+  const [jobName, setJobName] = useState("");
+  const [selectedJobAccountId, setSelectedJobAccountId] = useState<string | null>(null);
+  const [isResultsModalOpen, setIsResultsModalOpen] = useState(false);
+  const [selectedJobResults, setSelectedJobResults] = useState<{ status: string; results: any[] } | null>(null);
+  const [selectedJobName, setSelectedJobName] = useState("");
+  
+  // Batch sync state
+  const [isBatchSyncDialogOpen, setIsBatchSyncDialogOpen] = useState(false);
+  const [batchJobName, setBatchJobName] = useState("");
+  const [currentBatchSyncJobId, setCurrentBatchSyncJobId] = useState<string | null>(null);
+  const [batchSyncProgress, setBatchSyncProgress] = useState<any>(null);
+  const [isBatchResultsModalOpen, setIsBatchResultsModalOpen] = useState(false);
+  const [batchResults, setBatchResults] = useState<any>(null);
+  
+  // Import accounts state
+  const [isImportDialogOpen, setIsImportDialogOpen] = useState(false);
+  const [importData, setImportData] = useState("");
+  const [importFile, setImportFile] = useState<File | null>(null);
+
+  // Auto-detection state
+  const [isQuickAddDialogOpen, setIsQuickAddDialogOpen] = useState(false);
+  const [quickAddEmail, setQuickAddEmail] = useState("");
+  const [quickAddPassword, setQuickAddPassword] = useState("");
+  const [isAutoDetecting, setIsAutoDetecting] = useState(false);
+
+  // Sync state
+  const [currentSyncJobId, setCurrentSyncJobId] = useState<string | null>(null);
+
+  // Optimized data queries with parallel loading and better caching
+  const { data: accounts = [], isLoading: isLoadingAccounts, error: accountsError } = useQuery({ 
+    queryKey: ["emailAccounts"], 
+    queryFn: getEmailAccounts,
+    staleTime: 30000, // 30 seconds
+    gcTime: 300000, // 5 minutes (renamed from cacheTime)
+    retry: 2,
+    retryDelay: 1000
+  });
+  
+  const { data: proxies = [], isLoading: isLoadingProxies, error: proxiesError } = useQuery({ 
+    queryKey: ['proxies'], 
+    queryFn: getProxies,
+    staleTime: 60000, // 1 minute (proxies change less frequently)
+    gcTime: 600000, // 10 minutes (renamed from cacheTime)
+    retry: 2,
+    retryDelay: 1000
+  });
+  
+  const { data: jobs = [], isLoading: isLoadingJobs, error: jobsError } = useQuery({
+    queryKey: ['syncJobs'],
+    queryFn: getSyncJobs,
+    staleTime: 5000, // 5 seconds
+    gcTime: 60000, // 1 minute (renamed from cacheTime)
+    refetchInterval: 10000, // Reduced from 5s to 10s
+    refetchIntervalInBackground: false, // Don't refetch when tab not active
+    retry: 2,
+    retryDelay: 1000
+  });
+  
+  // Combined loading state for better UX
+  const isInitialLoading = isLoadingAccounts || isLoadingProxies || isLoadingJobs;
+  const hasErrors = accountsError || proxiesError || jobsError;
+
+  // Effect to update form when protocol changes
+  useEffect(() => {
+    if (formState.provider) {
+      handleProviderChange(formState.provider);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [protocol]);
+
+  // Use WebSocket context for real-time updates
+  const { lastMessage } = useWebSocketContext();
+  
+  // Handle WebSocket messages for account updates
+  useEffect(() => {
+    // Handle account status updates (these come as raw WebSocket messages, not SyncProgressEvents)
+    if (lastMessage && typeof lastMessage === 'object' && 'type' in lastMessage) {
+      const message = lastMessage as any;
+      if (message.type === 'ACCOUNT_STATUS_UPDATED' && message.payload) {
+        const updatedAccount = message.payload;
+        queryClient.setQueryData(['emailAccounts'], (oldData: any) => {
+          if (!oldData) return [];
+          return oldData.map((account: any) => 
+            account._id === updatedAccount._id ? { ...account, ...updatedAccount } : account
+          );
+        });
+      }
+    }
+  }, [lastMessage, queryClient]);
+
+  // Account management functions
+  const handleOpenAddAccountDialog = (open: boolean) => {
+    if (open) {
+      setFormState(initialFormState);
+      setProtocol('POP3');
+    }
+    setIsAddAccountDialogOpen(open);
+  };
+
+  const addAccountMutation = useMutation({
+    mutationFn: addEmailAccount,
+    onSuccess: () => {
+      toast.success("Account added successfully!");
+      queryClient.invalidateQueries({ queryKey: ["emailAccounts"] });
+      setIsAddAccountDialogOpen(false);
+    },
+    onError: (error) => {
+      toast.error(`Failed to add account: ${error.message}`);
+    },
+  });
+
+  const deleteAccountMutation = useMutation({
+    mutationFn: deleteEmailAccount,
+    onSuccess: () => {
+      toast.success("Account deleted successfully!");
+      queryClient.invalidateQueries({ queryKey: ["emailAccounts"] });
+    },
+    onError: (error) => {
+      toast.error(`Failed to delete account: ${error.message}`);
+    },
+  });
+
+  const deleteAllAccountsMutation = useMutation({
+    mutationFn: deleteAllEmailAccounts,
+    onSuccess: () => {
+      toast.success("All accounts have been deleted.");
+      queryClient.invalidateQueries({ queryKey: ["emailAccounts"] });
+    },
+    onError: (error) => {
+      toast.error(`Failed to delete all accounts: ${error.message}`);
+    },
+  });
+
+  // Auto-detection mutation
+  const autoDetectMutation = useMutation({
+    mutationFn: autoDetectEmailSettings,
+    onSuccess: async (result) => {
+      if (result.success && result.data) {
+        toast.success(`Settings auto-detected using ${result.data.provider.name}!`);
+        
+        // Automatically add the account with detected settings
+        const accountPayload: AddAccountPayload = {
+          email: result.data.email,
+          provider: result.data.provider.type,
+          auth: {
+            host: result.data.provider.host,
+            port: result.data.provider.port,
+            secure: result.data.provider.secure,
+            username: result.data.auth.user,
+            password: quickAddPassword, // Use the password from the form
+          },
+        };
+        
+        // Add the account using the detected settings
+        try {
+          await addEmailAccount(accountPayload);
+          toast.success("Account added successfully with auto-detected settings!");
+          queryClient.invalidateQueries({ queryKey: ["emailAccounts"] });
+          setIsQuickAddDialogOpen(false);
+          setQuickAddEmail("");
+          setQuickAddPassword("");
+        } catch (error: any) {
+          toast.error(`Failed to add account: ${error.message}`);
+        }
+      }
+    },
+    onError: (error) => {
+      toast.error(`Auto-detection failed: ${error.message}`);
+    },
+    onSettled: () => {
+      setIsAutoDetecting(false);
+    },
+  });
+
+  // Delete job mutations
+  const deleteJobMutation = useMutation({
+    mutationFn: deleteSyncJob,
+    onSuccess: () => {
+      toast.success("Job deleted successfully!");
+      queryClient.invalidateQueries({ queryKey: ["syncJobs"] });
+    },
+    onError: (error) => {
+      toast.error(`Failed to delete job: ${error.message}`);
+    },
+  });
+
+  const deleteAllJobsMutation = useMutation({
+    mutationFn: deleteAllSyncJobs,
+    onSuccess: () => {
+      toast.success("All jobs deleted successfully!");
+      queryClient.invalidateQueries({ queryKey: ["syncJobs"] });
+    },
+    onError: (error) => {
+      toast.error(`Failed to delete all jobs: ${error.message}`);
+    },
+  });
+
+  const handleProviderChange = (providerName: string) => {
+    const preset = providerPresets[providerName];
+    if (preset) {
+      const protocolSettings = preset[protocol.toLowerCase() as keyof typeof preset];
+      if (protocolSettings) {
+        setFormState(prev => ({
+          ...prev,
+          provider: providerName,
+          server: protocolSettings.server,
+          port: protocolSettings.port.toString(),
+          security: protocolSettings.security,
+        }));
+      }
+    } else {
+      setFormState(prev => ({ ...prev, provider: providerName }));
+    }
+  };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const { name, value } = e.target;
+    setFormState(prev => ({ ...prev, [name]: value }));
+  };
+
+  const handleSecurityChange = (value: string) => {
+    setFormState(prev => ({ ...prev, security: value }));
+  };
+
+  const handleProxyChange = (proxyId: string) => {
+    setFormState(prev => ({ ...prev, proxyId }));
+  };
+
+  const handleAddAccount = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const selectedProxy = proxies.find((p: any) => p._id === formState.proxyId);
+    const payload: AddAccountPayload = {
+      provider: formState.provider as 'IMAP' | 'POP3' | 'Exchange',
+      email: formState.email,
+      auth: {
+        username: formState.email,
+        password: formState.password,
+        host: formState.server,
+        port: parseInt(formState.port),
+        secure: formState.security === 'ssl',
+      },
+      proxyId: selectedProxy?._id,
+    };
+    addAccountMutation.mutate(payload);
+  };
+
+  // Quick Add handler for auto-detection
+  const handleQuickAdd = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    
+    if (!quickAddEmail || !quickAddPassword) {
+      toast.error('Please enter both email and password');
+      return;
+    }
+    
+    setIsAutoDetecting(true);
+    autoDetectMutation.mutate({
+      email: quickAddEmail,
+      password: quickAddPassword,
+    });
+  };
+
+  const handleOpenQuickAddDialog = (open: boolean) => {
+    if (!open) {
+      setQuickAddEmail("");
+      setQuickAddPassword("");
+      setIsAutoDetecting(false);
+    }
+    setIsQuickAddDialogOpen(open);
+  };
+
+  const handleDeleteAccount = (accountId: string) => {
+    deleteAccountMutation.mutate(accountId);
+  };
+
+  const handleDeleteAllAccounts = () => {
+    deleteAllAccountsMutation.mutate();
+  };
+
+  const handleDeleteJob = (jobId: string) => {
+    deleteJobMutation.mutate(jobId);
+  };
+
+  const handleDeleteAllJobs = () => {
+    deleteAllJobsMutation.mutate();
+  };
+
+  const handleBulkAdd = () => {
+    const lines = bulkAccounts.trim().split('\n').filter(line => line.trim());
+    
+    lines.forEach(line => {
+      const [email, password] = line.split(':').map(s => s.trim());
+      if (email && password) {
+        const domain = email.split('@')[1];
+        let detectedProvider = 'other';
+        
+        for (const [provider, config] of Object.entries(providerPresets)) {
+          if (config.domains && config.domains.some(d => domain.includes(d))) {
+            detectedProvider = provider;
+            break;
+          }
+        }
+        
+        const preset = providerPresets[detectedProvider];
+        const protocolSettings = preset?.[protocol.toLowerCase() as keyof typeof preset];
+        
+        const payload: AddAccountPayload = {
+          provider: detectedProvider as 'IMAP' | 'POP3' | 'Exchange',
+          email,
+          auth: {
+            username: email,
+            password: password,
+            host: protocolSettings?.server || '',
+            port: protocolSettings?.port || 993,
+            secure: protocolSettings?.security === 'ssl',
+          },
+        };
+        
+        addAccountMutation.mutate(payload);
+      }
+    });
+    
+    setBulkAccounts('');
+  };
+
+  // Job management functions
+  const createJobMutation = useMutation({
+    mutationFn: async ({ accountId, name }: { accountId: string, name: string }) => {
+      const account: any = accounts.find((acc: any) => acc._id === accountId);
+      if (!account) throw new Error("Account not found.");
+
+      let foldersToSync: string[] = [];
+
+      const imapProviders = ['gmail', 'outlook', 'yahoo', 'imap', 'exchange', 'comcast'];
+      if (imapProviders.includes(account.provider?.toLowerCase())) {
+        if (account.folders && account.folders.length > 0) {
+          foldersToSync = account.folders.map((f: any) => f.path);
+        } else {
+          throw new Error("No folders found for this account. Please reconnect the account.");
+        }
+      }
+
+      const syncResult = await startSync(accountId, foldersToSync, name);
+      return { ...syncResult, jobName: name };
+    },
+    onSuccess: (data) => {
+      toast.success(`Job "${data.jobName}" created and started successfully!`);
+      queryClient.invalidateQueries({ queryKey: ['syncJobs'] });
+      setIsCreateJobDialogOpen(false);
+      setJobName("");
+      setSelectedJobAccountId(null);
+    },
+    onError: (error: Error) => {
+      toast.error(`Failed to create job: ${error.message}`);
+    },
+  });
+
+  const fetchResultsMutation = useMutation({
+    mutationFn: getJobResults,
+    onSuccess: (data) => {
+      setSelectedJobResults(data);
+      setIsResultsModalOpen(true);
+    },
+    onError: (error: Error) => {
+      toast.error(`Failed to fetch results: ${error.message}`);
+    },
+  });
+
+  const handleCreateJob = () => {
+    if (selectedJobAccountId && jobName) {
+      createJobMutation.mutate({ accountId: selectedJobAccountId, name: jobName });
+    }
+  };
+
+  const handleViewResults = (job: any) => {
+    setSelectedJobName(job.name);
+    fetchResultsMutation.mutate(job._id);
+  };
+
+  // Import accounts functions
+  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) {
+      setImportFile(file);
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const content = e.target?.result as string;
+        setImportData(content);
+      };
+      reader.readAsText(file);
+    }
+  };
+
+  const parseImportData = (data: string) => {
+    try {
+      // Try parsing as JSON first
+      const jsonData = JSON.parse(data);
+      if (Array.isArray(jsonData)) {
+        return jsonData;
+      } else if (jsonData.accounts && Array.isArray(jsonData.accounts)) {
+        return jsonData.accounts;
+      } else {
+        return [jsonData];
+      }
+    } catch {
+      // Try parsing as CSV
+      const lines = data.trim().split('\n');
+      if (lines.length < 2) {
+        throw new Error('Invalid CSV format. Need at least header and one data row.');
+      }
+      
+      const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+      const accounts = [];
+      
+      for (let i = 1; i < lines.length; i++) {
+        const values = lines[i].split(',').map(v => v.trim());
+        const account: any = {};
+        
+        headers.forEach((header, index) => {
+          if (values[index]) {
+            switch (header) {
+              case 'email':
+                account.email = values[index];
+                break;
+              case 'provider':
+                account.provider = values[index];
+                break;
+              case 'host':
+              case 'server':
+                account.host = values[index];
+                break;
+              case 'port':
+                account.port = parseInt(values[index]) || 993;
+                break;
+              case 'username':
+                account.username = values[index];
+                break;
+              case 'password':
+                account.password = values[index];
+                break;
+              case 'secure':
+              case 'ssl':
+                account.secure = values[index].toLowerCase() === 'true';
+                break;
+            }
+          }
+        });
+        
+        if (account.email && account.provider) {
+          accounts.push(account);
+        }
+      }
+      
+      return accounts;
+    }
+  };
+
+  const handleImportAccounts = async () => {
+    if (!importData.trim()) {
+      toast.error('Please provide import data or upload a file.');
+      return;
+    }
+
+    try {
+      const accountsToImport = parseImportData(importData);
+      let successCount = 0;
+      let errorCount = 0;
+      let autoDetectedCount = 0;
+      
+      toast.info(`Starting import with auto-detection for ${accountsToImport.length} account(s)...`);
+      
+      for (const accountData of accountsToImport) {
+        try {
+          // Validate required fields for auto-detection
+          if (!accountData.email || !accountData.password) {
+            throw new Error(`Missing email or password for account: ${accountData.email || 'unknown'}`);
+          }
+
+          // Try auto-detection first
+          try {
+            const autoDetectResult = await autoDetectEmailSettings({
+              email: accountData.email,
+              password: accountData.password,
+            });
+
+            if (autoDetectResult.success && autoDetectResult.data) {
+              // Auto-detection successful, add account with detected settings
+              const payload: AddAccountPayload = {
+                email: autoDetectResult.data.email,
+                provider: autoDetectResult.data.provider.type,
+                auth: {
+                  host: autoDetectResult.data.provider.host,
+                  port: autoDetectResult.data.provider.port,
+                  secure: autoDetectResult.data.provider.secure,
+                  username: autoDetectResult.data.auth.user,
+                  password: accountData.password,
+                },
+              };
+
+              await addEmailAccount(payload);
+              successCount++;
+              autoDetectedCount++;
+            } else {
+              throw new Error(autoDetectResult.error || 'Auto-detection failed');
+            }
+          } catch (autoDetectError: any) {
+            // Auto-detection failed, try fallback with manual settings if provided
+            if (accountData.provider && accountData.host) {
+              // Fallback to manual configuration if available
+              const payload: AddAccountPayload = {
+                email: accountData.email,
+                provider: accountData.provider.toUpperCase(),
+                auth: {
+                  host: accountData.host,
+                  port: accountData.port || getDefaultPort(accountData.provider),
+                  secure: accountData.secure !== undefined ? accountData.secure : true,
+                  username: accountData.username || accountData.email,
+                  password: accountData.password
+                }
+              };
+
+              await addEmailAccount(payload);
+              successCount++;
+            } else {
+              throw new Error(`Auto-detection failed: ${autoDetectError.message}`);
+            }
+          }
+        } catch (error: any) {
+          console.error(`Failed to import account ${accountData.email}:`, error);
+          errorCount++;
+        }
+      }
+
+      // Show detailed success message
+      if (successCount > 0) {
+        const message = autoDetectedCount > 0 
+          ? `Successfully imported ${successCount} account(s) (${autoDetectedCount} auto-detected)!`
+          : `Successfully imported ${successCount} account(s)!`;
+        toast.success(message);
+        queryClient.invalidateQueries({ queryKey: ['emailAccounts'] });
+      }
+      
+      if (errorCount > 0) {
+        toast.error(`Failed to import ${errorCount} account(s). Check console for details.`);
+      }
+
+      // Reset import state
+      setIsImportDialogOpen(false);
+      setImportData('');
+      setImportFile(null);
+      
+    } catch (error: any) {
+      toast.error(`Import failed: ${error.message}`);
+    }
+  };
+
+  const getDefaultHost = (provider: string) => {
+    const presets = providerPresets.find(p => p.name.toLowerCase() === provider.toLowerCase());
+    return presets?.host || 'imap.gmail.com';
+  };
+
+  const getDefaultPort = (provider: string) => {
+    const presets = providerPresets.find(p => p.name.toLowerCase() === provider.toLowerCase());
+    return presets?.port || 993;
+  };
+
+  const generateSampleImportData = () => {
+    const sampleJSON = {
+      accounts: [
+        {
+          email: "user1@gmail.com",
+          password: "your_app_password_here"
+        },
+        {
+          email: "user2@outlook.com",
+          password: "your_password_here"
+        },
+        {
+          email: "user3@yahoo.com",
+          password: "your_password_here"
+        }
+      ]
+    };
+    
+    return JSON.stringify(sampleJSON, null, 2);
+  };
+
+  const generateSampleCSV = () => {
+    return `email,password\nuser1@gmail.com,your_app_password_here\nuser2@outlook.com,your_password_here\nuser3@yahoo.com,your_password_here`;
+  };
+
+  // Job management mutations
+  const createJobMutation = useMutation({
+    mutationFn: async ({ accountId, name }: { accountId: string; name: string }) => {
+      return startSync({ accountId, name });
+    },
+    onSuccess: () => {
+      toast.success("Job created and started successfully!");
+      queryClient.invalidateQueries({ queryKey: ["syncJobs"] });
+      setIsCreateJobDialogOpen(false);
+      setJobName("");
+      setSelectedJobAccountId(null);
+    },
+    onError: (error) => {
+      toast.error(`Failed to create job: ${error.message}`);
+    },
+  });
+
+  const fetchResultsMutation = useMutation({
+    mutationFn: getJobResults,
+    onSuccess: (data) => {
+      setSelectedJobResults(data);
+      setIsResultsModalOpen(true);
+    },
+    onError: (error) => {
+      toast.error(`Failed to fetch results: ${error.message}`);
+    },
+  });
+
+  const handleCreateJob = () => {
+    if (!selectedJobAccountId || !jobName) {
+      toast.error("Please select an account and enter a job name.");
+      return;
+    }
+    createJobMutation.mutate({ accountId: selectedJobAccountId, name: jobName });
+  };
+
+  const handleViewResults = (job: any) => {
+    setSelectedJobName(job.name);
+    fetchResultsMutation.mutate(job._id);
+  };
+
+  // Utility functions
+  const getStatusColor = (status: string) => {
+    switch (status) {
+      case "connected": return "bg-green-500 text-white";
+      case "error": return "bg-red-500 text-white";
+      default: return "bg-gray-500 text-white";
+    }
+  };
+
+  const getProviderIcon = (provider: string) => {
+    return <Mail className="h-5 w-5 text-primary" />;
+  };
+
+  const getJobStatusBadge = (status: string) => {
+    switch (status) {
+      case 'pending':
+        return <Badge variant="secondary"><Clock className="mr-1 h-3 w-3" />Pending</Badge>;
+      case 'running':
+        return <Badge variant="default"><RefreshCw className="mr-1 h-3 w-3 animate-spin" />Running</Badge>;
+      case 'completed':
+        return <Badge variant="default" className="bg-green-500"><CheckCircle className="mr-1 h-3 w-3" />Completed</Badge>;
+      case 'failed':
+        return <Badge variant="destructive"><XCircle className="mr-1 h-3 w-3" />Failed</Badge>;
+      default:
+        return <Badge variant="outline"><AlertCircle className="mr-1 h-3 w-3" />Unknown</Badge>;
+    }
+  };
+
+  const getProviderIcon = (provider: string) => {
+    return <Mail className="h-5 w-5 text-primary" />;
+  };
+
+  const getJobStatusBadge = (status: string) => {
+    switch (status) {
+      case 'pending':
+        return <Badge variant="secondary"><Clock className="mr-1 h-3 w-3" />Pending</Badge>;
+      case 'running':
+        return <Badge variant="default"><RefreshCw className="mr-1 h-3 w-3 animate-spin" />Running</Badge>;
+      case 'completed':
+        return <Badge variant="default" className="bg-green-500"><CheckCircle className="mr-1 h-3 w-3" />Completed</Badge>;
+      case 'failed':
+        return <Badge variant="destructive"><XCircle className="mr-1 h-3 w-3" />Failed</Badge>;
+      default:
+        return <Badge variant="outline"><AlertCircle className="mr-1 h-3 w-3" />Unknown</Badge>;
+    }
+  };
+
+  // Show loading overlay during initial data fetch
+  if (isInitialLoading) {
+    return (
+      <div className="container mx-auto p-6 space-y-8">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-3xl font-bold">Email Accounts & Jobs</h1>
+            <p className="text-muted-foreground">Loading your data...</p>
+          </div>
+        </div>
+        
+        <div className="flex items-center justify-center min-h-[400px]">
+          <div className="text-center space-y-4">
+            <Loader2 className="h-8 w-8 animate-spin mx-auto text-primary" />
+            <div className="space-y-2">
+              <p className="text-lg font-medium">Loading your data</p>
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                {isLoadingAccounts && <span>• Email accounts</span>}
+                {isLoadingProxies && <span>• Proxies</span>}
+                {isLoadingJobs && <span>• Crawl jobs</span>}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  
+  // Show error state if all requests failed
+  if (hasErrors && !accounts.length && !proxies.length && !jobs.length) {
+    return (
+      <div className="container mx-auto p-6 space-y-8">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-3xl font-bold">Email Accounts & Jobs</h1>
+            <p className="text-muted-foreground">Unable to load data</p>
+          </div>
+        </div>
+        
+        <div className="flex items-center justify-center min-h-[400px]">
+          <div className="text-center space-y-4">
+            <XCircle className="h-8 w-8 mx-auto text-destructive" />
+            <div className="space-y-2">
+              <p className="text-lg font-medium">Failed to load data</p>
+              <p className="text-sm text-muted-foreground">Please check your connection and try refreshing the page.</p>
+              <Button onClick={() => window.location.reload()} variant="outline">
+                <RefreshCw className="h-4 w-4 mr-2" />
+                Retry
+              </Button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="container mx-auto p-6 space-y-8">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-3xl font-bold">Email Accounts & Jobs</h1>
+          <p className="text-muted-foreground">Manage your email accounts and crawl jobs in one place</p>
+        </div>
+      </div>
+
+      {/* Main Content Tabs */}
+      <Tabs defaultValue="accounts" className="w-full">
+        <TabsList className="grid w-full grid-cols-2">
+          <TabsTrigger value="accounts">Email Accounts ({accounts.length})</TabsTrigger>
+          <TabsTrigger value="jobs">Crawl Jobs ({jobs.length})</TabsTrigger>
+        </TabsList>
+
+        {/* Email Accounts Tab */}
+        <TabsContent value="accounts" className="space-y-6">
+          <div className="flex items-center justify-between">
+            <h2 className="text-2xl font-semibold">Email Accounts</h2>
+            <div className="flex gap-2">
+              <Dialog open={isQuickAddDialogOpen} onOpenChange={handleOpenQuickAddDialog}>
+                <DialogTrigger asChild>
+                  <Button className="bg-gradient-primary">
+                    <Mail className="h-4 w-4 mr-2" />
+                    Quick Add
+                  </Button>
+                </DialogTrigger>
+                <DialogContent className="max-w-md">
+                  <DialogHeader>
+                    <DialogTitle>Quick Add Email Account</DialogTitle>
+                    <DialogDescription>
+                      Enter your email and password. We'll automatically detect the server settings.
+                    </DialogDescription>
+                  </DialogHeader>
+                  <form onSubmit={handleQuickAdd} className="space-y-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="quickEmail">Email Address</Label>
+                      <Input
+                        id="quickEmail"
+                        type="email"
+                        placeholder="your.email@example.com"
+                        value={quickAddEmail}
+                        onChange={(e) => setQuickAddEmail(e.target.value)}
+                        required
+                        disabled={isAutoDetecting}
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="quickPassword">Password</Label>
+                      <Input
+                        id="quickPassword"
+                        type="password"
+                        placeholder="Your email password"
+                        value={quickAddPassword}
+                        onChange={(e) => setQuickAddPassword(e.target.value)}
+                        required
+                        disabled={isAutoDetecting}
+                      />
+                    </div>
+                    <div className="text-sm text-muted-foreground">
+                      💡 We'll test common email providers (Gmail, Outlook, Yahoo, etc.) to find the right settings automatically.
+                    </div>
+                    <DialogFooter>
+                      <Button 
+                        type="submit" 
+                        className="w-full bg-gradient-primary" 
+                        disabled={isAutoDetecting || !quickAddEmail || !quickAddPassword}
+                      >
+                        {isAutoDetecting ? (
+                          <>
+                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                            Auto-detecting...
+                          </>
+                        ) : (
+                          'Add Account'
+                        )}
+                      </Button>
+                    </DialogFooter>
+                  </form>
+                </DialogContent>
+              </Dialog>
+
+              <Dialog open={isAddAccountDialogOpen} onOpenChange={handleOpenAddAccountDialog}>
+                <DialogTrigger asChild>
+                  <Button variant="outline">
+                    <Settings className="h-4 w-4 mr-2" />
+                    Manual Setup
+                  </Button>
+                </DialogTrigger>
+                <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+                  <DialogHeader>
+                    <DialogTitle>Add Email Account</DialogTitle>
+                    <DialogDescription>
+                      Connect your email account to start crawling for unique email addresses.
+                    </DialogDescription>
+                  </DialogHeader>
+                  
+                  <Tabs defaultValue="single" className="w-full">
+                    <TabsList className="grid w-full grid-cols-2">
+                      <TabsTrigger value="single">Single Account</TabsTrigger>
+                      <TabsTrigger value="bulk">Bulk Add</TabsTrigger>
+                    </TabsList>
+                    
+                    <TabsContent value="single" className="space-y-4">
+                      <form onSubmit={handleAddAccount} className="space-y-4">
+                        <div className="space-y-2">
+                          <Label>Protocol</Label>
+                          <RadioGroup
+                            value={protocol}
+                            onValueChange={(value) => setProtocol(value as 'IMAP' | 'POP3')}
+                            className="flex space-x-4"
+                          >
+                            <div className="flex items-center space-x-2">
+                              <RadioGroupItem value="POP3" id="pop3" />
+                              <Label htmlFor="pop3">POP3 (Default)</Label>
+                            </div>
+                            <div className="flex items-center space-x-2">
+                              <RadioGroupItem value="IMAP" id="imap" />
+                              <Label htmlFor="imap">IMAP</Label>
+                            </div>
+                          </RadioGroup>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-4">
+                          <div className="space-y-2">
+                            <Label htmlFor="provider">Provider</Label>
+                            <Select value={formState.provider} onValueChange={handleProviderChange}>
+                              <SelectTrigger>
+                                <SelectValue placeholder="Select provider" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {Object.keys(providerPresets).map((provider) => (
+                                  <SelectItem key={provider} value={provider}>
+                                    {provider.charAt(0).toUpperCase() + provider.slice(1)}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </div>
+
+                          <div className="space-y-2">
+                            <Label htmlFor="email">Email</Label>
+                            <Input
+                              id="email"
+                              name="email"
+                              type="email"
+                              value={formState.email}
+                              onChange={handleInputChange}
+                              placeholder="your@email.com"
+                              required
+                            />
+                          </div>
+                        </div>
+
+                        <div className="space-y-2">
+                          <Label htmlFor="password">Password</Label>
+                          <Input
+                            id="password"
+                            name="password"
+                            type="password"
+                            value={formState.password}
+                            onChange={handleInputChange}
+                            placeholder="Your email password"
+                            required
+                          />
+                        </div>
+
+                        <div className="grid grid-cols-3 gap-4">
+                          <div className="space-y-2">
+                            <Label htmlFor="server">Server</Label>
+                            <Input
+                              id="server"
+                              name="server"
+                              value={formState.server}
+                              onChange={handleInputChange}
+                              placeholder="mail.example.com"
+                              required
+                            />
+                          </div>
+
+                          <div className="space-y-2">
+                            <Label htmlFor="port">Port</Label>
+                            <Input
+                              id="port"
+                              name="port"
+                              type="number"
+                              value={formState.port}
+                              onChange={handleInputChange}
+                              placeholder="993"
+                              required
+                            />
+                          </div>
+
+                          <div className="space-y-2">
+                            <Label htmlFor="security">Security</Label>
+                            <Select value={formState.security} onValueChange={handleSecurityChange}>
+                              <SelectTrigger>
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="ssl">SSL</SelectItem>
+                                <SelectItem value="tls">TLS</SelectItem>
+                                <SelectItem value="none">None</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+                        </div>
+
+                        <div className="space-y-2">
+                          <Label htmlFor="proxy">Proxy (Optional)</Label>
+                          <Select value={formState.proxyId} onValueChange={handleProxyChange}>
+                            <SelectTrigger>
+                              <SelectValue placeholder="Select a proxy (optional)" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="">No Proxy</SelectItem>
+                              {proxies.map((proxy: any) => (
+                                <SelectItem key={proxy._id} value={proxy._id}>
+                                  {proxy.host}:{proxy.port} ({proxy.type})
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+
+                        <Button type="submit" className="w-full bg-gradient-primary" disabled={addAccountMutation.isPending}>
+                          {addAccountMutation.isPending ? 'Adding...' : 'Add Account'}
+                        </Button>
+                      </form>
+                    </TabsContent>
+                    
+                    <TabsContent value="bulk" className="space-y-4">
+                      <div className="space-y-4">
+                        <div className="space-y-2">
+                          <Label htmlFor="bulkAccounts">Bulk Account List</Label>
+                          <Textarea
+                            id="bulkAccounts"
+                            placeholder="email1@example.com:password1&#10;email2@example.com:password2&#10;email3@example.com:password3"
+                            className="min-h-[200px] font-mono text-sm"
+                            value={bulkAccounts}
+                            onChange={(e) => setBulkAccounts(e.target.value)}
+                          />
+                        </div>
+                        <Button className="w-full bg-gradient-primary" onClick={handleBulkAdd} disabled={addAccountMutation.isPending || bulkAccounts.trim() === ''}>
+                          {addAccountMutation.isPending ? 'Adding...' : 'Add Accounts'}
+                        </Button>
+                      </div>
+                    </TabsContent>
+                  </Tabs>
+                </DialogContent>
+              </Dialog>
+
+              <Dialog open={isImportDialogOpen} onOpenChange={setIsImportDialogOpen}>
+                <DialogTrigger asChild>
+                  <Button variant="outline">
+                    <Upload className="h-4 w-4 mr-2" />
+                    Import Accounts
+                  </Button>
+                </DialogTrigger>
+                <DialogContent className="max-w-4xl max-h-[80vh] overflow-y-auto">
+                  <DialogHeader>
+                    <DialogTitle>Import Email Accounts</DialogTitle>
+                    <DialogDescription>
+                      Import multiple email accounts with auto-detection! Just provide email:password pairs in JSON or CSV format. Server settings will be detected automatically.
+                    </DialogDescription>
+                  </DialogHeader>
+                  <div className="space-y-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="importFile">Upload File (JSON/CSV)</Label>
+                      <Input
+                        id="importFile"
+                        type="file"
+                        accept=".json,.csv,.txt"
+                        onChange={handleFileUpload}
+                      />
+                    </div>
+                    
+                    <div className="space-y-2">
+                      <Label htmlFor="importData">Or Paste Data</Label>
+                      <Textarea
+                        id="importData"
+                        value={importData}
+                        onChange={(e) => setImportData(e.target.value)}
+                        placeholder="Paste JSON or CSV data here..."
+                        className="min-h-[200px] font-mono text-sm"
+                      />
+                    </div>
+                    
+                    <div className="space-y-4">
+                      <div className="bg-blue-50 dark:bg-blue-950 p-4 rounded-lg border border-blue-200 dark:border-blue-800">
+                        <div className="flex items-center gap-2 mb-2">
+                          <Mail className="h-4 w-4 text-blue-600" />
+                          <span className="font-medium text-blue-900 dark:text-blue-100">Auto-Detection Enabled</span>
+                        </div>
+                        <p className="text-sm text-blue-700 dark:text-blue-300">
+                          Just provide email:password pairs! Server settings (IMAP/POP3, hosts, ports) will be automatically detected for Gmail, Outlook, Yahoo, and 20+ other providers.
+                        </p>
+                      </div>
+                      
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div className="space-y-2">
+                          <Label>Simple JSON Format (Recommended)</Label>
+                          <div className="bg-muted p-3 rounded text-xs font-mono overflow-x-auto">
+                            <pre>{generateSampleImportData()}</pre>
+                          </div>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setImportData(generateSampleImportData())}
+                          >
+                            Use JSON Sample
+                          </Button>
+                        </div>
+                        
+                        <div className="space-y-2">
+                          <Label>Simple CSV Format</Label>
+                          <div className="bg-muted p-3 rounded text-xs font-mono overflow-x-auto">
+                            <pre>{generateSampleCSV()}</pre>
+                          </div>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setImportData(generateSampleCSV())}
+                          >
+                            Use CSV Sample
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <DialogFooter>
+                    <Button
+                      onClick={handleImportAccounts}
+                      disabled={!importData.trim()}
+                      className="bg-gradient-primary"
+                    >
+                      <FileUp className="mr-2 h-4 w-4" />
+                      Import Accounts
+                    </Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
+
+              <Button
+                variant="destructive"
+                onClick={handleDeleteAllAccounts}
+                disabled={accounts.length === 0 || deleteAllAccountsMutation.isPending}
+              >
+                <Trash2 className="h-4 w-4 mr-2" />
+                Delete All
+              </Button>
+            </div>
+          </div>
+
+          {/* Sync Results Display */}
+          {currentSyncJobId && <ResultsDisplay syncJobId={currentSyncJobId} />}
+
+          {/* Accounts Grid */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {isLoadingAccounts && <p>Loading accounts...</p>}
+            {!isLoadingAccounts && accounts.length === 0 && (
+              <div className="col-span-full text-center py-8">
+                <Mail className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
+                <p className="text-muted-foreground">No email accounts added yet.</p>
+              </div>
+            )}
+            {accounts.map((account: any) => (
+              <Card key={account._id} className="border-border hover:shadow-elegant transition-shadow">
+                <CardHeader className="pb-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      {getProviderIcon(account.provider)}
+                      <CardTitle className="text-lg">{account.email}</CardTitle>
+                    </div>
+                    <Badge className={getStatusColor(account.status)}>
+                      {account.status === "connected" && <Check className="h-3 w-3 mr-1" />}
+                      {account.status === "error" && <X className="h-3 w-3 mr-1" />}
+                      {account.status}
+                    </Badge>
+                  </div>
+                  <CardDescription className="break-all">
+                    {account.provider} via {account.auth.host}
+                  </CardDescription>
+                </CardHeader>
+                
+                <CardContent className="space-y-4">
+                  <div className="space-y-2">
+                    <div className="flex justify-between text-sm">
+                      <span className="text-muted-foreground">Last Sync</span>
+                      <span className="font-medium">
+                        {account.lastSync ? new Date(account.lastSync).toLocaleString() : 'Never'}
+                      </span>
+                    </div>
+                  </div>
+                  
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="flex-1"
+                      onClick={() => setSelectedAccountId(account._id)}
+                      disabled={account.status !== 'connected' || account.provider.toLowerCase() === 'pop3'}
+                    >
+                      <Settings className="h-4 w-4 mr-1" />
+                      Select Folders
+                    </Button>
+                    <Button 
+                      variant="outline" 
+                      size="sm" 
+                      className="text-destructive hover:text-destructive"
+                      onClick={() => handleDeleteAccount(account._id)}
+                      disabled={deleteAccountMutation.isPending}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            ))}
+          </div>
+        </TabsContent>
+
+        {/* Crawl Jobs Tab */}
+        <TabsContent value="jobs" className="space-y-6">
+          <div className="flex items-center justify-between">
+            <h2 className="text-2xl font-semibold">Crawl Jobs</h2>
+            <div className="flex gap-2">
+              <Dialog open={isCreateJobDialogOpen} onOpenChange={setIsCreateJobDialogOpen}>
+                <DialogTrigger asChild>
+                  <Button className="bg-gradient-primary">
+                    <Plus className="h-4 w-4 mr-2" />
+                    Create Job
+                  </Button>
+                </DialogTrigger>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>Create New Crawl Job</DialogTitle>
+                    <DialogDescription>
+                      Select an email account and create a new crawl job to extract unique email addresses.
+                    </DialogDescription>
+                  </DialogHeader>
+                  <div className="space-y-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="jobName">Job Name</Label>
+                      <Input
+                        id="jobName"
+                        value={jobName}
+                        onChange={(e) => setJobName(e.target.value)}
+                        placeholder="Enter job name"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="account">Email Account</Label>
+                      <Select value={selectedJobAccountId || ""} onValueChange={setSelectedJobAccountId}>
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select an account" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {accounts
+                            .filter((account: any) => account.status === 'connected')
+                            .map((account: any) => (
+                              <SelectItem key={account._id} value={account._id}>
+                                {account.email} ({account.provider})
+                              </SelectItem>
+                            ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                  <DialogFooter>
+                    <Button
+                      onClick={handleCreateJob}
+                      disabled={!selectedJobAccountId || !jobName || createJobMutation.isPending}
+                      className="bg-gradient-primary"
+                    >
+                      {createJobMutation.isPending ? (
+                        <>
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          Creating...
+                        </>
+                      ) : (
+                        <>
+                          <Play className="mr-2 h-4 w-4" />
+                          Create & Start Job
+                        </>
+                      )}
+                    </Button>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
+              
+              <Button
+                variant="destructive"
+                onClick={handleDeleteAllJobs}
+                disabled={jobs.length === 0 || deleteAllJobsMutation.isPending}
+              >
+                <Trash2 className="h-4 w-4 mr-2" />
+                Delete All Jobs
+              </Button>
+            </div>
+          </div>
+
+          {/* Recent Jobs Card */}
+          <Card>
+            <CardHeader>
+              <CardTitle>Recent Jobs</CardTitle>
+              <CardDescription>
+                Track your email crawling jobs with real-time progress and email counts
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {isLoadingJobs ? (
+                <div className="flex items-center justify-center py-8">
+                  <Loader2 className="h-6 w-6 animate-spin" />
+                  <span className="ml-2">Loading jobs...</span>
+                </div>
+              ) : jobs.length === 0 ? (
+                <div className="text-center py-8">
+                  <FileText className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
+                  <h3 className="text-lg font-medium mb-2">No crawl jobs</h3>
+                  <p className="text-muted-foreground mb-4">Create your first crawl job to extract email addresses</p>
+                  <Button onClick={() => setIsCreateJobDialogOpen(true)} className="bg-gradient-primary">
+                    <Plus className="h-4 w-4 mr-2" />
+                    Create Job
+                  </Button>
+                </div>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Job Name</TableHead>
+                      <TableHead>Account</TableHead>
+                      <TableHead>Email Count</TableHead>
+                      <TableHead>Status</TableHead>
+                      <TableHead className="text-right">Actions</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {jobs.map((job: any) => (
+                      <TableRow key={job._id}>
+                        <TableCell className="font-medium">{job.name}</TableCell>
+                        <TableCell>{job.accountEmail}</TableCell>
+                        <TableCell>
+                          {job.status === 'running' ? (
+                            <div className="flex items-center gap-2">
+                              <Loader2 className="h-4 w-4 animate-spin text-blue-600" />
+                              <span className="font-medium text-blue-600">
+                                {job.emailCount || 0} emails
+                              </span>
+                            </div>
+                          ) : (
+                            <span className="font-medium">
+                              {job.emailCount || 0} emails
+                            </span>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {job.status === 'running' ? (
+                            <div className="space-y-1">
+                              <div className="flex items-center gap-2 text-sm">
+                                <span className="text-muted-foreground">
+                                  {job.processedFolders || 0}/{job.totalFolders || 0} folders
+                                </span>
+                              </div>
+                              <div className="w-full bg-gray-200 rounded-full h-2">
+                                <div 
+                                  className="bg-blue-600 h-2 rounded-full transition-all duration-300" 
+                                  style={{ 
+                                    width: `${job.totalFolders ? (job.processedFolders / job.totalFolders) * 100 : 0}%` 
+                                  }}
+                                ></div>
+                              </div>
+                            </div>
+                          ) : job.status === 'completed' ? (
+                            <div className="flex items-center gap-2 text-sm text-green-600">
+                              <CheckCircle className="h-4 w-4" />
+                              <span>Complete</span>
+                            </div>
+                          ) : job.status === 'failed' ? (
+                            <div className="flex items-center gap-2 text-sm text-red-600">
+                              <XCircle className="h-4 w-4" />
+                              <span>Failed</span>
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-2 text-sm text-gray-500">
+                              <Clock className="h-4 w-4" />
+                              <span>Queued</span>
+                            </div>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button variant="ghost" className="h-8 w-8 p-0">
+                                <MoreHorizontal className="h-4 w-4" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end">
+                              <DropdownMenuItem 
+                                onClick={() => handleViewResults(job)}
+                                disabled={job.status !== 'completed' || fetchResultsMutation.isPending}
+                              >
+                                {fetchResultsMutation.isPending && fetchResultsMutation.variables === job._id ? (
+                                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                ) : (
+                                  <Eye className="mr-2 h-4 w-4" />
+                                )}
+                                View Results
+                              </DropdownMenuItem>
+                              <DropdownMenuItem disabled>
+                                <Download className="mr-2 h-4 w-4" />
+                                Download Results
+                              </DropdownMenuItem>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem 
+                                className="text-red-600" 
+                                onClick={() => handleDeleteJob(job._id)}
+                                disabled={deleteJobMutation.isPending}
+                              >
+                                {deleteJobMutation.isPending ? (
+                                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                ) : (
+                                  <Trash2 className="mr-2 h-4 w-4" />
+                                )}
+                                Delete Job
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
+
+      {/* Results Modal */}
+      <Dialog open={isResultsModalOpen} onOpenChange={setIsResultsModalOpen}>
+        <DialogContent className="max-w-4xl h-[80vh]">
+          <DialogHeader>
+            <DialogTitle>Results for: {selectedJobName}</DialogTitle>
+            <DialogDescription>
+              Found {selectedJobResults?.results?.length || 0} unique emails.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex-grow overflow-y-auto p-4">
+            {selectedJobResults?.results?.length ? (
+              <div className="space-y-4">
+                <div className="bg-muted p-4 rounded-lg">
+                  <h4 className="font-medium mb-2">Unique Email Addresses:</h4>
+                  <div className="text-sm font-mono bg-background p-3 rounded border max-h-96 overflow-y-auto">
+                    {selectedJobResults.results.join(',')}
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <Button 
+                    variant="outline" 
+                    size="sm"
+                    onClick={() => {
+                      navigator.clipboard.writeText(selectedJobResults.results.join(','));
+                      toast.success('Email addresses copied to clipboard!');
+                    }}
+                  >
+                    <FileText className="mr-2 h-4 w-4" />
+                    Copy to Clipboard
+                  </Button>
+                  <Button 
+                    variant="outline" 
+                    size="sm"
+                    onClick={() => {
+                      const blob = new Blob([selectedJobResults.results.join(',')], { type: 'text/plain' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `${selectedJobName.replace(/[^a-z0-9]/gi, '_').toLowerCase()}_emails.txt`;
+                      document.body.appendChild(a);
+                      a.click();
+                      document.body.removeChild(a);
+                      URL.revokeObjectURL(url);
+                      toast.success('Email addresses downloaded!');
+                    }}
+                  >
+                    <Download className="mr-2 h-4 w-4" />
+                    Download as TXT
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div className="text-center text-muted-foreground py-8">
+                No email addresses found.
+              </div>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Folder Selection Modal */}
+      {selectedAccountId && (
+        <FolderSelectionModal
+          accountId={selectedAccountId}
+          onOpenChange={(isOpen) => {
+            if (!isOpen) {
+              setSelectedAccountId(null);
+            }
+          }}
+          onSyncStarted={(syncJobId) => setCurrentSyncJobId(syncJobId)}
+        />
+      )}
+    </div>
+  );
+}
+          <Card>
+            <CardHeader>
+              <CardTitle>Recent Jobs</CardTitle>
+              <CardDescription>Monitor your crawl jobs with live email counts and progress tracking</CardDescription>
+            </CardHeader>
+            <CardContent>
+              {isLoadingJobs ? (
+                <div className="flex items-center justify-center py-8">
+                  <Loader2 className="h-8 w-8 animate-spin" />
+                </div>
+              ) : jobs.length === 0 ? (
+                <div className="text-center py-8">
+                  <Play className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
+                  <p className="text-muted-foreground">No crawl jobs created yet.</p>
+                </div>
+              ) : (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Job Name</TableHead>
+                      <TableHead>Account</TableHead>
+                      <TableHead>Status</TableHead>
+                      <TableHead>Created</TableHead>
+                      <TableHead>Email Count</TableHead>
+                      <TableHead>Progress</TableHead>
+                      <TableHead className="text-right">Actions</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {jobs.map((job: any) => (
+                      <TableRow key={job._id}>
+                        <TableCell className="font-medium">{job.name}</TableCell>
+                        <TableCell>
+                          {accounts.find((acc: any) => acc._id === job.accountId)?.email || 'Unknown'}
+                        </TableCell>
+                        <TableCell>{getJobStatusBadge(job.status)}</TableCell>
+                        <TableCell>{new Date(job.createdAt).toLocaleString()}</TableCell>
+                        <TableCell>
+                          {job.status === 'completed' ? (
+                            <div className="flex items-center gap-2">
+                              <CheckCircle className="h-4 w-4 text-green-500" />
+                              <span className="font-medium text-green-700 dark:text-green-400">
+                                {job.resultCount || 0} emails
+                              </span>
+                            </div>
+                          ) : job.status === 'running' ? (
+                            <div className="flex items-center gap-2">
+                              <Loader2 className="h-4 w-4 animate-spin text-blue-500" />
+                              <span className="text-blue-700 dark:text-blue-400">
+                                {job.currentCount || 0} emails
+                              </span>
+                            </div>
+                          ) : job.status === 'failed' ? (
+                            <div className="flex items-center gap-2">
+                              <XCircle className="h-4 w-4 text-red-500" />
+                              <span className="text-red-700 dark:text-red-400">
+                                Failed
+                              </span>
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-2">
+                              <Clock className="h-4 w-4 text-gray-500" />
+                              <span className="text-muted-foreground">
+                                Pending
+                              </span>
+                            </div>
+                          )}
+                        </TableCell>
+                        <TableCell>
+                          {job.status === 'running' ? (
+                            <div className="space-y-1">
+                              <div className="flex items-center gap-2 text-sm">
+                                <span className="text-muted-foreground">
+                                  {job.processedFolders || 0}/{job.totalFolders || 0} folders
+                                </span>
+                              </div>
+                              <div className="w-full bg-gray-200 rounded-full h-2">
+                                <div 
+                                  className="bg-blue-600 h-2 rounded-full transition-all duration-300" 
+                                  style={{ 
+                                    width: `${job.totalFolders ? (job.processedFolders / job.totalFolders) * 100 : 0}%` 
+                                  }}
+                                ></div>
+                              </div>
+                            </div>
+                          ) : job.status === 'completed' ? (
+                            <div className="flex items-center gap-2 text-sm text-green-600">
+                              <CheckCircle className="h-4 w-4" />
+                              <span>Complete</span>
+                            </div>
+                          ) : job.status === 'failed' ? (
+                            <div className="flex items-center gap-2 text-sm text-red-600">
+                              <XCircle className="h-4 w-4" />
+                              <span>Failed</span>
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-2 text-sm text-gray-500">
+                              <Clock className="h-4 w-4" />
+                              <span>Queued</span>
+                            </div>
+                          )}
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button variant="ghost" className="h-8 w-8 p-0">
+                                <MoreHorizontal className="h-4 w-4" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end">
+                              <DropdownMenuItem 
+                                onClick={() => handleViewResults(job)}
+                                disabled={job.status !== 'completed' || fetchResultsMutation.isPending}
+                              >
+                                {fetchResultsMutation.isPending && fetchResultsMutation.variables === job._id ? (
+                                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                ) : (
+                                  <Eye className="mr-2 h-4 w-4" />
+                                )}
+                                View Results
+                              </DropdownMenuItem>
+                              <DropdownMenuItem disabled>
+                                <Download className="mr-2 h-4 w-4" />
+                                Download Results
+                              </DropdownMenuItem>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem 
+                                className="text-red-600" 
+                                onClick={() => handleDeleteJob(job._id)}
+                                disabled={deleteJobMutation.isPending}
+                              >
+                                {deleteJobMutation.isPending ? (
+                                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                ) : (
+                                  <Trash2 className="mr-2 h-4 w-4" />
+                                )}
+                                Delete Job
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
+
+      {/* Results Modal */}
+      <Dialog open={isResultsModalOpen} onOpenChange={setIsResultsModalOpen}>
+        <DialogContent className="max-w-4xl h-[80vh]">
+          <DialogHeader>
+            <DialogTitle>Results for: {selectedJobName}</DialogTitle>
+            <DialogDescription>
+              Found {selectedJobResults?.results?.length || 0} unique emails.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex-grow overflow-y-auto p-4">
+            {selectedJobResults?.results?.length ? (
+              <div className="space-y-4">
+                <div className="bg-muted p-4 rounded-lg">
+                  <h4 className="font-medium mb-2">Unique Email Addresses:</h4>
+                  <div className="text-sm font-mono bg-background p-3 rounded border max-h-96 overflow-y-auto">
+                    {selectedJobResults.results.join(',')}
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                  <Button 
+                    variant="outline" 
+                    size="sm"
+                    onClick={() => {
+                      navigator.clipboard.writeText(selectedJobResults.results.join(','));
+                      toast.success('Email addresses copied to clipboard!');
+                    }}
+                  >
+                    <FileText className="mr-2 h-4 w-4" />
+                    Copy to Clipboard
+                  </Button>
+                  <Button 
+                    variant="outline" 
+                    size="sm"
+                    onClick={() => {
+                      const blob = new Blob([selectedJobResults.results.join(',')], { type: 'text/plain' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `${selectedJobName.replace(/[^a-z0-9]/gi, '_').toLowerCase()}_emails.txt`;
+                      document.body.appendChild(a);
+                      a.click();
+                      document.body.removeChild(a);
+                      URL.revokeObjectURL(url);
+                      toast.success('Email addresses downloaded!');
+                    }}
+                  >
+                    <Download className="mr-2 h-4 w-4" />
+                    Download as TXT
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div className="text-center text-muted-foreground py-8">
+                No email addresses found.
+              </div>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Folder Selection Modal */}
+      {selectedAccountId && (
+        <FolderSelectionModal
+          accountId={selectedAccountId}
+          onOpenChange={(isOpen) => {
+            if (!isOpen) {
+              setSelectedAccountId(null);
+            }
+          }}
+          onSyncStarted={(syncJobId) => setCurrentSyncJobId(syncJobId)}
+        />
+      )}
+    </div>
+  );
+}
