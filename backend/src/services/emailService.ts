@@ -555,16 +555,23 @@ export class EmailService extends EventEmitter {
 
       // Note: POP3 handler ignores folder argument and syncs INBOX by default.
       const syncGenerator = handler.syncMessages({ folders });
-      
-      // Add timeout protection for the sync operation
-      const SYNC_TIMEOUT = 8 * 60 * 1000; // 8 minutes timeout (leave 2 minutes for cleanup)
-      const syncPromise = (async () => {
+
+      // No timeout - let large mailboxes complete fully
+      // The sync will continue until all messages are processed or a connection error occurs
+      let lastProgressUpdate = Date.now();
+      const PROGRESS_UPDATE_INTERVAL = 5000; // Update progress every 5 seconds minimum
+
+      try {
         for await (const message of syncGenerator) {
           allMessages.push(message);
           this.emit('message', { syncJobId, message });
 
-          // Update job progress every 10 messages for efficiency
-          if (allMessages.length % 10 === 0) {
+          const now = Date.now();
+
+          // Update job progress every 50 messages OR every 5 seconds (whichever comes first)
+          if (allMessages.length % 50 === 0 || (now - lastProgressUpdate) > PROGRESS_UPDATE_INTERVAL) {
+            lastProgressUpdate = now;
+
             // Update job progress using database adapter
             await db.updateSyncJob(syncJobId, {
               current_count: allMessages.length
@@ -573,24 +580,18 @@ export class EmailService extends EventEmitter {
             // Broadcast message count progress via Supabase real-time
             const progressPercentage = Math.min(95, (allMessages.length / 1000) * 100); // Estimate progress
             await supabaseRealtime.broadcastSyncProgress(syncJobId, progressPercentage, userId || account.user_id || 'unknown', `Processed ${allMessages.length} messages`);
+
+            // Log progress every 1000 messages
+            if (allMessages.length % 1000 === 0) {
+              logger.info(`${logContext} - Progress: ${allMessages.length} messages processed`);
+            }
           }
         }
-      })();
-      
-      // Race between sync operation and timeout
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('Sync operation timed out after 8 minutes')), SYNC_TIMEOUT);
-      });
-      
-      try {
-        await Promise.race([syncPromise, timeoutPromise]);
         logger.info(`${logContext} - Sync completed successfully, processed ${allMessages.length} messages`);
       } catch (error: any) {
-        if (error.message?.includes('timed out') || 
-            error.message?.includes('Socket timeout') || 
-            error.code === 'ETIMEOUT') {
-          logger.warn(`${logContext} - Sync timed out (${error.message}), processed ${allMessages.length} messages so far`);
-          // Don't throw timeout errors, just log them and continue with partial results
+        if (error.message?.includes('Socket timeout') || error.code === 'ETIMEOUT') {
+          logger.warn(`${logContext} - Socket timeout after processing ${allMessages.length} messages`);
+          // Continue with partial results
         } else {
           logger.error(`${logContext} - Sync failed with error:`, error);
           throw error; // Re-throw other errors
