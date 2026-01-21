@@ -42,6 +42,32 @@ export const createUserSupabaseClient = (userJwt: string) => {
   });
 };
 
+// Retry helper for database operations with exponential backoff
+async function retryWithBackoff<T>(
+  operation: () => Promise<T>,
+  maxRetries: number = 3,
+  baseDelay: number = 1000
+): Promise<T> {
+  let lastError: any;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error: any) {
+      lastError = error;
+      // Check if it's a network/fetch error that's worth retrying
+      if (error.message?.includes('fetch failed') || error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT') {
+        const delay = baseDelay * Math.pow(2, attempt);
+        console.warn(`Database operation failed (attempt ${attempt + 1}/${maxRetries}), retrying in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        // Non-retryable error
+        throw error;
+      }
+    }
+  }
+  throw lastError;
+}
+
 // Type definitions for complete Supabase schema
 export interface SupabaseEmailAccount {
   id: string;
@@ -396,18 +422,20 @@ export class DatabaseAdapter {
 
   // Job operations - consolidated to use email_jobs table
   async updateSyncJob(jobId: string, updates: Partial<SupabaseSyncJob>): Promise<SupabaseSyncJob> {
-    const { data, error } = await supabaseAdmin
-      .from(TABLES.JOBS)
-      .update({
-        ...updates,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', jobId)
-      .select()
-      .single();
-    
-    if (error) throw error;
-    return data;
+    return retryWithBackoff(async () => {
+      const { data, error } = await supabaseAdmin
+        .from(TABLES.JOBS)
+        .update({
+          ...updates,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', jobId)
+        .select()
+        .single();
+
+      if (error) throw error;
+      return data;
+    });
   }
 
   // Proxy operations

@@ -572,14 +572,19 @@ export class EmailService extends EventEmitter {
           if (allMessages.length % 50 === 0 || (now - lastProgressUpdate) > PROGRESS_UPDATE_INTERVAL) {
             lastProgressUpdate = now;
 
-            // Update job progress using database adapter
-            await db.updateSyncJob(syncJobId, {
-              current_count: allMessages.length
-            });
+            // Update job progress using database adapter - wrapped in try-catch to prevent sync failure
+            try {
+              await db.updateSyncJob(syncJobId, {
+                current_count: allMessages.length
+              });
 
-            // Broadcast message count progress via Supabase real-time
-            const progressPercentage = Math.min(95, (allMessages.length / 1000) * 100); // Estimate progress
-            await supabaseRealtime.broadcastSyncProgress(syncJobId, progressPercentage, userId || account.user_id || 'unknown', `Processed ${allMessages.length} messages`);
+              // Broadcast message count progress via Supabase real-time
+              const progressPercentage = Math.min(95, (allMessages.length / 1000) * 100); // Estimate progress
+              await supabaseRealtime.broadcastSyncProgress(syncJobId, progressPercentage, userId || account.user_id || 'unknown', `Processed ${allMessages.length} messages`);
+            } catch (dbError: any) {
+              // Log but don't fail - progress updates are not critical
+              logger.warn(`${logContext} - Failed to update progress in database: ${dbError.message}`);
+            }
 
             // Log progress every 1000 messages
             if (allMessages.length % 1000 === 0) {
