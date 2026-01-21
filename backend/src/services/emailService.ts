@@ -603,19 +603,21 @@ export class EmailService extends EventEmitter {
         processed_folders: folders.length
       });
 
-      // Extract unique email addresses from all message fields
-      const extractedEmails = allMessages.flatMap(message => {
-        const emails: string[] = [];
-        if (message.from?.address) emails.push(message.from.address);
-        if (message.to) emails.push(...message.to.map(r => r.address).filter(Boolean));
-        if (message.cc) emails.push(...(message.cc || []).map(r => r.address).filter(Boolean));
-        if (message.bcc) emails.push(...(message.bcc || []).map(r => r.address).filter(Boolean));
-        return emails;
-      });
+      // Extract unique email addresses from all message fields (duplicates removed)
+      const extractedEmails = [...new Set(
+        allMessages.flatMap(message => {
+          const emails: string[] = [];
+          if (message.from?.address) emails.push(message.from.address);
+          if (message.to) emails.push(...message.to.map(r => r.address).filter(Boolean));
+          if (message.cc) emails.push(...(message.cc || []).map(r => r.address).filter(Boolean));
+          if (message.bcc) emails.push(...(message.bcc || []).map(r => r.address).filter(Boolean));
+          return emails;
+        })
+      )];
 
-      logger.info(`Extracted ${extractedEmails.length} total email addresses from ${allMessages.length} messages`);
+      logger.info(`Extracted ${extractedEmails.length} unique emails from ${allMessages.length} messages (duplicates removed)`);
 
-      // Handle partial token deduction for total emails (if userId provided)
+      // Handle partial token deduction for unique emails (if userId provided)
       let tokensDeducted = 0;
       let tokensNeeded = 0;
       let availableTokens = 0;
@@ -635,13 +637,13 @@ export class EmailService extends EventEmitter {
             userId,
             extractedEmails.length,
             undefined, // Pass undefined instead of syncJobId to avoid FK constraint
-            `Fetched ${extractedEmails.length} total email addresses from ${account.email} (Job: ${syncJobId})`
+            `Fetched ${extractedEmails.length} unique emails from ${account.email} (Job: ${syncJobId})`
           );
 
           if (tokenDeductionSuccess) {
             tokensDeducted = extractedEmails.length;
             visibleEmailCount = extractedEmails.length;
-            logger.info(`${logContext} - Successfully deducted ${tokensDeducted} tokens for ${extractedEmails.length} total emails for user ${userId}`);
+            logger.info(`${logContext} - Successfully deducted ${tokensDeducted} tokens for ${extractedEmails.length} unique emails for user ${userId}`);
           } else {
             logger.warn(`${logContext} - Failed to deduct ${extractedEmails.length} tokens for user ${userId}. Sync completed but tokens not charged.`);
           }
@@ -651,7 +653,7 @@ export class EmailService extends EventEmitter {
             userId,
             availableTokens,
             undefined,
-            `Partial fetch: ${availableTokens}/${extractedEmails.length} total emails from ${account.email} (Job: ${syncJobId})`
+            `Partial fetch: ${availableTokens}/${extractedEmails.length} unique emails from ${account.email} (Job: ${syncJobId})`
           );
 
           if (tokenDeductionSuccess) {
@@ -693,7 +695,7 @@ export class EmailService extends EventEmitter {
         syncJobId,
         100,
         userId || account.user_id || 'unknown',
-        `Sync complete: ${extractedEmails.length} total email addresses found`
+        `Sync complete: ${extractedEmails.length} unique emails found`
       );
 
       // Broadcast sync completion via Supabase real-time
@@ -701,7 +703,7 @@ export class EmailService extends EventEmitter {
         id: syncJobId,
         status: 'completed',
         progress: 100,
-        message: `Completed: Found ${extractedEmails.length} total email addresses from ${allMessages.length} messages`
+        message: `Completed: Found ${extractedEmails.length} unique emails from ${allMessages.length} messages`
       });
       
       await supabaseRealtime.broadcastNotification('success', `Sync completed for ${account.email}`, userId || account.user_id || 'unknown', {
@@ -711,7 +713,7 @@ export class EmailService extends EventEmitter {
         email: account.email
       });
 
-      logger.info(`Sync completed for job ${syncJobId}. Found ${extractedEmails.length} total email addresses from ${allMessages.length} messages.`);
+      logger.info(`Sync completed for job ${syncJobId}. Found ${extractedEmails.length} unique emails from ${allMessages.length} messages.`);
     } catch (error: any) {
       logger.error(`Sync failed for job ${syncJobId}:`, error);
 

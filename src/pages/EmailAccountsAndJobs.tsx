@@ -252,8 +252,8 @@ export default function EmailAccountsAndJobs() {
                     const message = payload.payload.message || '';
                     const progress = payload.payload.progress || job.progress;
 
-                    // Handle completion message: "Sync complete: X total email addresses found"
-                    const completionMatch = message.match(/Sync complete: (\d+) total email addresses found/);
+                    // Handle completion message: "Sync complete: X unique emails found"
+                    const completionMatch = message.match(/Sync complete: (\d+) unique emails found/);
                     if (completionMatch) {
                       // Force a full job refresh to get the latest token information from the database
                       setTimeout(() => {
@@ -1722,7 +1722,7 @@ export default function EmailAccountsAndJobs() {
           <DialogHeader>
             <DialogTitle>Results for: {selectedJobName}</DialogTitle>
             <DialogDescription>
-              Processed <strong>{selectedJob?.current_count || 0}</strong> messages and found <strong>{selectedJobResults?.results?.length || 0}</strong> total email addresses.
+              Processed <strong>{selectedJob?.current_count || 0}</strong> messages and found <strong>{selectedJobResults?.results?.length || 0}</strong> unique email addresses (duplicates removed).
             </DialogDescription>
           </DialogHeader>
           <div className="flex-grow overflow-y-auto p-4">
@@ -1791,7 +1791,7 @@ export default function EmailAccountsAndJobs() {
 
 
                 <div className="bg-muted p-4 rounded-lg">
-                  <h4 className="font-medium mb-2">Email Addresses ({selectedJobResults.results.length}):</h4>
+                  <h4 className="font-medium mb-2">Unique Email Addresses ({selectedJobResults.results.length}):</h4>
                   <div className="text-sm bg-background p-3 rounded border max-h-96 overflow-y-auto">
                     <div className="space-y-0">
                       {(() => {
