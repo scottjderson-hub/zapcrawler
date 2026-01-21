@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState, ReactNode } from 'react'
+import { createContext, useContext, useEffect, useState, useRef, ReactNode } from 'react'
 import { User, Session } from '@supabase/supabase-js'
 import { supabase, authHelpers } from '@/lib/supabase'
 import { toast } from 'sonner'
@@ -23,6 +23,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [user, setUser] = useState<User | null>(null)
   const [session, setSession] = useState<Session | null>(null)
   const [loading, setLoading] = useState(true)
+  const isInitialLoadRef = useRef(true)
 
   // Helper function to initialize user billing data
   const initializeUserBillingData = async (user: User, accessToken: string) => {
@@ -72,6 +73,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
         console.error('Error in getInitialSession:', error)
       } finally {
         setLoading(false)
+        // Mark initial load complete after a short delay to let auth events settle
+        setTimeout(() => {
+          isInitialLoadRef.current = false
+        }, 1000)
       }
     }
 
@@ -90,7 +95,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
       // Handle different auth events
       switch (event) {
         case 'SIGNED_IN':
-          toast.success('Successfully signed in!')
+          // Only show toast on actual sign-in, not on page refresh/session restore
+          if (!isInitialLoadRef.current) {
+            toast.success('Successfully signed in!')
+          }
           // Initialize user billing data if this is a new user
           if (session?.user) {
             initializeUserBillingData(session.user, session.access_token)
